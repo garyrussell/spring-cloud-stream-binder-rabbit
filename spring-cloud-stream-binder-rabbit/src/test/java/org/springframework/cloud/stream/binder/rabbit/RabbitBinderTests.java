@@ -43,6 +43,7 @@ import org.springframework.amqp.core.DirectExchange;
 import org.springframework.amqp.core.Exchange;
 import org.springframework.amqp.core.ExchangeTypes;
 import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.core.TopicExchange;
 import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
@@ -980,6 +981,56 @@ public class RabbitBinderTests extends
 		defaultConsumerBinding1.unbind();
 		defaultConsumerBinding2.unbind();
 		outputBinding.unbind();
+	}
+
+	@Test
+	public void testPollableConsumer() throws Exception {
+		RabbitTestBinder binder = getBinder();
+		ExtendedConsumerProperties<RabbitConsumerProperties> consumerProperties = createConsumerProperties();
+		consumerProperties.getExtension().setPrefix("bindertest.");
+		PollableResourceChannel channel = binder.getBinder().bindPollingConsumer("polling", "foo", consumerProperties);
+		RabbitTemplate template = new RabbitTemplate(this.rabbitAvailableRule.getResource());
+		template.send("", "bindertest.polling.foo",
+				new org.springframework.amqp.core.Message("foo".getBytes(), new MessageProperties()));
+		template.send("", "bindertest.polling.foo",
+				new org.springframework.amqp.core.Message("bar".getBytes(), new MessageProperties()));
+		int n = 0;
+		Message<?> in = null;
+		while (n++ < 100) {
+			in = channel.receive();
+			if (in == null) {
+				Thread.sleep(100);
+			}
+			else {
+				break;
+			}
+		}
+		assertThat(in).isNotNull();
+		assertThat(in.getPayload()).isEqualTo("foo".getBytes());
+		channel.close();
+		n = 0;
+		while (n++ < 100) {
+			in = channel.receive();
+			if (in == null) {
+				Thread.sleep(100);
+			}
+			else {
+				break;
+			}
+		}
+		assertThat(in).isNotNull();
+		assertThat(in.getPayload()).isEqualTo("bar".getBytes());
+		channel.closeWithRewind(); // requeue
+
+		in = channel.receive();
+		assertThat(in).isNotNull();
+		assertThat(in.getPayload()).isEqualTo("bar".getBytes());
+		channel.close();
+		in = channel.receive();
+		assertThat(in).isNull();
+		RabbitAdmin admin = new RabbitAdmin(this.rabbitAvailableRule.getResource());
+		admin.deleteQueue("bindertest.polling.foo");
+		admin.deleteExchange("bindertest.polling");
 	}
 
 	@Test

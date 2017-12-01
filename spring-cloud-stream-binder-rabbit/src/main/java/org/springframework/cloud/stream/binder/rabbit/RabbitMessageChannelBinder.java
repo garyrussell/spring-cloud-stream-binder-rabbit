@@ -16,13 +16,17 @@
 
 package org.springframework.cloud.stream.binder.rabbit;
 
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
+import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessagePostProcessor;
@@ -31,6 +35,7 @@ import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.connection.LocalizedQueueConnectionFactory;
 import org.springframework.amqp.rabbit.connection.RabbitConnectionFactoryBean;
+import org.springframework.amqp.rabbit.connection.RabbitUtils;
 import org.springframework.amqp.rabbit.core.BatchingRabbitTemplate;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.rabbit.core.support.BatchingStrategy;
@@ -41,6 +46,7 @@ import org.springframework.amqp.rabbit.retry.RejectAndDontRequeueRecoverer;
 import org.springframework.amqp.rabbit.retry.RepublishMessageRecoverer;
 import org.springframework.amqp.rabbit.support.DefaultMessagePropertiesConverter;
 import org.springframework.amqp.rabbit.support.MessagePropertiesConverter;
+import org.springframework.amqp.rabbit.support.RabbitExceptionTranslator;
 import org.springframework.amqp.support.postprocessor.DelegatingDecompressingPostProcessor;
 import org.springframework.amqp.support.postprocessor.GZipPostProcessor;
 import org.springframework.beans.factory.DisposableBean;
@@ -62,6 +68,7 @@ import org.springframework.cloud.stream.provisioning.ProducerDestination;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.integration.amqp.inbound.AmqpInboundChannelAdapter;
 import org.springframework.integration.amqp.outbound.AmqpOutboundEndpoint;
+import org.springframework.integration.amqp.support.AmqpHeaderMapper;
 import org.springframework.integration.amqp.support.AmqpMessageHeaderErrorMessageStrategy;
 import org.springframework.integration.amqp.support.DefaultAmqpHeaderMapper;
 import org.springframework.integration.channel.AbstractMessageChannel;
@@ -73,6 +80,7 @@ import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.MessageHandler;
 import org.springframework.messaging.MessagingException;
 import org.springframework.messaging.support.ErrorMessage;
+import org.springframework.messaging.support.GenericMessage;
 import org.springframework.retry.RetryPolicy;
 import org.springframework.retry.backoff.ExponentialBackOffPolicy;
 import org.springframework.retry.policy.SimpleRetryPolicy;
@@ -82,7 +90,9 @@ import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
 
 import com.rabbitmq.client.AMQP;
+import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Envelope;
+import com.rabbitmq.client.GetResponse;
 
 /**
  * A {@link org.springframework.cloud.stream.binder.Binder} implementation backed by
@@ -612,11 +622,110 @@ public class RabbitMessageChannelBinder
 		return rabbitTemplate;
 	}
 
+	public PollableResourceChannel bindPollingConsumer(String name, String group,
+			ExtendedConsumerProperties<RabbitConsumerProperties> properties) {
+		ConsumerDestination destination = this.provisioningProvider.provisionConsumerDestination(name, group,
+				properties);
+		return new RabbitBinderPollableChannel(this.connectionFactory, destination.getName());
+	}
+
 	private String getStackTraceAsString(Throwable cause) {
 		StringWriter stringWriter = new StringWriter();
 		PrintWriter printWriter = new PrintWriter(stringWriter, true);
 		cause.printStackTrace(printWriter);
 		return stringWriter.getBuffer().toString();
+	}
+
+	public static class RabbitBinderPollableChannel extends PollableResourceChannel {
+
+		private static final ThreadLocal<Channel> channels = new ThreadLocal<>();
+
+		private static final ThreadLocal<Long> deliveryTags = new ThreadLocal<>();
+
+		private final ConnectionFactory connectionFactory;
+
+		private final MessagePropertiesConverter propsConverter = new DefaultMessagePropertiesConverter();
+
+		private final AmqpHeaderMapper headerMapper = DefaultAmqpHeaderMapper.inboundMapper();
+
+		private final String queue;
+
+		public RabbitBinderPollableChannel(ConnectionFactory connectionFactory, String queue) {
+//			Assert.isTrue(connectionFactory2.getCacheMode().equals(CacheMode.CHANNEL),
+//					"CacheMode must be CHANNEL");
+			this.connectionFactory = connectionFactory;
+			this.queue = queue;
+		}
+
+		@Override
+		protected org.springframework.messaging.Message<?> doReceive(long timeout) {
+			Channel channel = channels.get();
+			if (channel == null || !channel.isOpen()) {
+				try {
+					if (channel != null) {
+						RabbitUtils.closeChannel(channel); // return the proxy to the cache
+					}
+					channel = this.connectionFactory.createConnection().createChannel(false);
+				}
+				catch (AmqpException e) {
+					return null;
+				}
+			}
+			try {
+				GetResponse resp = channel.basicGet(this.queue, false);
+				if (resp == null) {
+					try {
+						channel.close();
+					}
+					catch (TimeoutException e) {
+					}
+					return null;
+				}
+				channels.set(channel);
+				deliveryTags.set(resp.getEnvelope().getDeliveryTag());
+				MessageProperties messageProperties = propsConverter.toMessageProperties(resp.getProps(),
+						resp.getEnvelope(), StandardCharsets.UTF_8.name());
+				Map<String, Object> headers = this.headerMapper.toHeadersFromRequest(messageProperties);
+				return new GenericMessage<>(resp.getBody(), headers);
+			}
+			catch (IOException e) {
+				try {
+					channels.get().close();
+				}
+				catch (IOException | TimeoutException e1) {
+					e1.printStackTrace();
+				}
+				channels.remove();
+				throw RabbitExceptionTranslator.convertRabbitAccessException(e);
+			}
+		}
+
+		@Override
+		public void closeWithRewind() throws IOException {
+			channels.get().basicReject(deliveryTags.get(), true);
+			try {
+				channels.get().close();
+			}
+			catch (TimeoutException e) {
+				e.printStackTrace();
+			}
+			channels.remove();
+			deliveryTags.remove();
+		}
+
+		@Override
+		public void close() throws IOException {
+			channels.get().basicAck(deliveryTags.get(), false);
+			try {
+				channels.get().close();
+			}
+			catch (TimeoutException e) {
+				e.printStackTrace();
+			}
+			channels.remove();
+			deliveryTags.remove();
+		}
+
 	}
 
 }
